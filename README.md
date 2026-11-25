@@ -1,4 +1,4 @@
-# Lokaler KI-Text-Prüfer (Deutsch) — Setup & Kurzanleitung (`ki_text_pruefer-v9.py`)
+# Lokaler KI-Text-Prüfer (Deutsch) — Setup & Kurzanleitung
 
 Dieses Tool prüft deutsche PDF-, Markdown- und Reintexte **komplett lokal** auf typische KI-Schreibmuster, statistische Auffälligkeiten, tiefere linguistische Merkmale (`spaCy`) sowie optional auf **Perplexität** (`dbmdz/german-gpt2`) und eine **Zweitprüfung über Ollama**.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lokaler KI-Text-Prüfer v9 (Deutsch) — Tiefere Linguistik, Informationstheorie & lokale Perplexität
+Lokaler KI-Text-Prüfer v10 (Deutsch) — Tiefere Linguistik, Informationstheorie & lokale Perplexität
 
 Verbesserungen in v5:
 - Tiefere spaCy-Linguistik (mit Score-Anbindung):
@@ -58,6 +58,46 @@ except Exception as exc:
 # ---------------------------------------------------------------------------
 # Konfiguration: Sensitivität & deutsche Muster
 # ---------------------------------------------------------------------------
+
+CONFIG_PATH = Path.home() / ".ki_text_pruefer_config.json"
+
+
+def load_user_config() -> dict:
+    try:
+        if CONFIG_PATH.exists():
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_user_config(updates: dict) -> None:
+    try:
+        cfg = load_user_config()
+        cfg.update(updates)
+        CONFIG_PATH.write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def get_saved_ppl_model(default: str = "dbmdz/german-gpt2") -> Tuple[str, bool]:
+    """
+    Gibt (modell_oder_ordner, ist_gespeicherter_lokaler_ordner) zurück.
+    """
+    cfg = load_user_config()
+    saved = str(cfg.get("ppl_model", "")).strip()
+    if not saved:
+        return default, False
+    p = Path(saved).expanduser()
+    if p.is_dir():
+        return str(p), True
+    return saved, False
+
 
 SENSITIVITY_PROFILES = {
     "Konservativ": {
@@ -1307,7 +1347,7 @@ def launch_gui():
     from tkinter import filedialog, messagebox, scrolledtext, ttk
 
     root = tk.Tk()
-    root.title("Lokaler KI-Text-Prüfer v8 (Deutsch — Linguistik, Perplexität & Ollama-Chooser)")
+    root.title("Lokaler KI-Text-Prüfer v10 (Deutsch — Linguistik, Perplexität & Ollama-Chooser)")
     root.geometry("1280x860")
 
     current_source = {"name": "Direkteingabe"}
@@ -1321,13 +1361,26 @@ def launch_gui():
     toolbar2 = ttk.Frame(root, padding=(6, 0, 6, 4))
     toolbar2.pack(fill=tk.X)
 
-    sensitivity_var = tk.StringVar(value="Ausgewogen")
-    use_ppl_var = tk.BooleanVar(value=False)
-    ppl_all_var = tk.BooleanVar(value=False)
-    ppl_model_var = tk.StringVar(value="dbmdz/german-gpt2")
+    user_cfg = load_user_config()
+    saved_ppl_model, has_saved_local_dir = get_saved_ppl_model()
+    saved_use_ppl = bool(user_cfg.get("use_perplexity", has_saved_local_dir))
+    saved_ppl_all = bool(user_cfg.get("ppl_all_passages", False))
+    saved_sensitivity = user_cfg.get("sensitivity", "Ausgewogen")
+    if saved_sensitivity not in SENSITIVITY_PROFILES:
+        saved_sensitivity = "Ausgewogen"
+
+    sensitivity_var = tk.StringVar(value=saved_sensitivity)
+    use_ppl_var = tk.BooleanVar(value=saved_use_ppl)
+    ppl_all_var = tk.BooleanVar(value=saved_ppl_all)
+    ppl_model_var = tk.StringVar(value=saved_ppl_model)
     use_ollama_var = tk.BooleanVar(value=False)
-    ollama_model_var = tk.StringVar(value="llama3.2")
-    status_var = tk.StringVar(value="Bereit (rein lokale Prüfung)")
+    ollama_model_var = tk.StringVar(value=str(user_cfg.get("ollama_model", "llama3.2")))
+    initial_status = (
+        f"Bereit | Gespeicherter Modell-Ordner: {Path(saved_ppl_model).name}"
+        if has_saved_local_dir
+        else "Bereit (rein lokale Prüfung)"
+    )
+    status_var = tk.StringVar(value=initial_status)
 
     def on_load_pdf():
         path = filedialog.askopenfilename(
@@ -1432,6 +1485,15 @@ def launch_gui():
         analyze_btn.configure(state=tk.DISABLED)
         status_var.set("Analysiere (inkl. Linguistik / ggf. Perplexität)...")
 
+        current_ppl = ppl_model_var.get().strip() or "dbmdz/german-gpt2"
+        save_user_config({
+            "ppl_model": current_ppl,
+            "use_perplexity": bool(use_ppl_var.get()),
+            "ppl_all_passages": bool(ppl_all_var.get()),
+            "sensitivity": sensitivity_var.get(),
+            "ollama_model": clean_ollama_model_name(ollama_model_var.get()) or "llama3.2",
+        })
+
         def worker():
             report = analyze_document(
                 raw,
@@ -1487,6 +1549,7 @@ def launch_gui():
         def loader():
             try:
                 _tok, _mod, dev, max_pos = load_perplexity_model(m_name)
+                save_user_config({"ppl_model": m_name})
                 msg = f"Modell '{m_name}' bereit (Gerät: {dev}, max. {max_pos} Tokens)."
                 root.after(0, lambda: (
                     status_var.set(msg),
@@ -1520,14 +1583,18 @@ def launch_gui():
         variable=ppl_all_var,
     ).pack(side=tk.LEFT, padx=(0, 6))
     def on_choose_ppl_folder():
+        current_val = ppl_model_var.get().strip()
+        init_dir = str(Path(current_val).expanduser()) if current_val and Path(current_val).expanduser().is_dir() else str(Path.home())
         folder = filedialog.askdirectory(
-            title="Lokalen Modell-Ordner auswählen (z. B. german-gpt2)"
+            title="Lokalen Modell-Ordner auswählen (z. B. german-gpt2)",
+            initialdir=init_dir,
         )
         if not folder:
             return
         ppl_model_var.set(folder)
         use_ppl_var.set(True)
-        status_var.set(f"Lokaler Modell-Ordner gewählt: {Path(folder).name}")
+        save_user_config({"ppl_model": folder, "use_perplexity": True})
+        status_var.set(f"Lokaler Modell-Ordner gewählt & gespeichert: {Path(folder).name}")
 
     ttk.Entry(toolbar2, textvariable=ppl_model_var, width=22).pack(side=tk.LEFT, padx=2)
     ttk.Button(toolbar2, text="Ordner wählen...", command=on_choose_ppl_folder).pack(side=tk.LEFT, padx=2)
@@ -1726,7 +1793,7 @@ def launch_gui():
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Lokaler KI-Text-Prüfer v9 (Deutsch)")
+    parser = argparse.ArgumentParser(description="Lokaler KI-Text-Prüfer v10 (Deutsch)")
     parser.add_argument("--cli", type=str, help="Pfad zu einer PDF- oder Textdatei für den Terminal-Modus")
     parser.add_argument(
         "--sensitivity",
@@ -1736,7 +1803,7 @@ def main():
     )
     parser.add_argument("--perplexity", action="store_true", help="Lokale Perplexität berechnen")
     parser.add_argument("--ppl-all", action="store_true", help="Perplexität auf alle Passagen anwenden (nicht nur Grauzone)")
-    parser.add_argument("--ppl-model", default="dbmdz/german-gpt2", help="HuggingFace-Modell für Perplexität")
+    parser.add_argument("--ppl-model", default=None, help="HuggingFace-Modell oder gespeicherter lokaler Ordner für Perplexität")
     parser.add_argument("--ollama", action="store_true", help="Grauzonen-Passagen via lokalem Ollama prüfen")
     parser.add_argument("--ollama-model", default="llama3.2", help="Ollama-Modellname (Standard: llama3.2)")
     args = parser.parse_args()
@@ -1752,7 +1819,7 @@ def main():
             source_name=p.name,
             sensitivity=args.sensitivity,
             use_perplexity=args.perplexity,
-            ppl_model=args.ppl_model,
+            ppl_model=args.ppl_model or get_saved_ppl_model()[0],
             ppl_all_passages=args.ppl_all,
             use_ollama=args.ollama,
             ollama_model=args.ollama_model,

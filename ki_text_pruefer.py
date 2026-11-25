@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lokaler KI-Text-Prüfer v10 (Deutsch) — Tiefere Linguistik, Informationstheorie & lokale Perplexität
+Lokaler KI-Text-Prüfer v11 (Deutsch) — Tiefere Linguistik, Informationstheorie & lokale Perplexität
 
 Verbesserungen in v5:
 - Tiefere spaCy-Linguistik (mit Score-Anbindung):
@@ -234,6 +234,63 @@ MODAL_PARTICLES = [
     "nämlich", "sowieso", "eh", "wohl", "schließlich",
 ]
 
+# Semantik: Deutsche Abschwächungen (Hedges)
+GERMAN_HEDGES = [
+    r"\bmöglicherweise\b",
+    r"\btendenziell\b",
+    r"\bgewissermaßen\b",
+    r"\bin gewisser weise\b",
+    r"\bscheinbar\b",
+    r"\banscheinend\b",
+    r"\bvermutlich\b",
+    r"\bwahrscheinlich\b",
+    r"\beventuell\b",
+    r"\bwomöglich\b",
+    r"\bunter umständen\b",
+    r"\bim grunde\b",
+    r"\bweitgehend\b",
+    r"\bin der regel\b",
+    r"\beinigermaßen\b",
+    r"\bpotenziell\b",
+    r"\bstreng genommen\b",
+    r"\bsozusagen\b",
+    r"\bteilweise\b",
+    r"\bbisweilen\b",
+]
+
+# Emotion & Valenz: Geglättete positive KI-Tonalität vs. menschliche negative Ausschläge
+GERMAN_POSITIVE_SMOOTH_WORDS = {
+    "wertvoll", "wertvolle", "wertvollen", "wertvoller",
+    "bereichernd", "bereichernde", "vielversprechend", "vielversprechende",
+    "positiv", "positive", "positiven", "harmonisch", "harmonische",
+    "konstruktiv", "konstruktive", "förderlich", "gewinnbringend",
+    "bemerkenswert", "bemerkenswerte", "zielführend", "zielführende",
+    "hilfreich", "hilfreiche", "vorteilhaft", "vorteilhafte",
+    "optimistisch", "optimistische", "erfolgreich", "erfolgreiche",
+    "beeindruckend", "beeindruckende", "faszinierend", "faszinierende",
+    "inspirierend", "inspirierende", "stimmig", "stimmige",
+}
+
+GERMAN_NEGATIVE_STRONG_WORDS = {
+    "frustrierend", "frustrierende", "ärgerlich", "ärgerliche",
+    "katastrophal", "katastrophale", "absurd", "absurde",
+    "lächerlich", "lächerliche", "nervig", "nervige", "nervt",
+    "mühsam", "mühsame", "enttäuschend", "enttäuschende",
+    "chaotisch", "chaotische", "unsinnig", "unsinnige",
+    "miserabel", "miserable", "furchtbar", "furchtbare",
+    "peinlich", "peinliche", "schrecklich", "schreckliche",
+    "fatal", "fatale", "ärgern", "gescheitert", "desaster",
+    "quatsch", "blödsinn", "unbrauchbar", "unzumutbar",
+}
+
+# Psycholinguistik: Konkrete vs. abstrakte Marker
+CONCRETE_OBJECT_WORDS = {
+    "haus", "tisch", "stuhl", "buch", "straße", "baum", "wasser", "auto",
+    "zug", "bahnhof", "tür", "fenster", "papier", "stift", "bildschirm",
+    "tastatur", "kaffee", "hand", "auge", "stadt", "dorf", "schule",
+    "jahr", "monat", "tag", "stunde", "minute", "euro", "prozent",
+}
+
 CHATBOT_TECH_PATTERNS = [
     ("Markdown-Überschrift", r"(?m)^#{1,6}\s+\S+"),
     ("Markdown-Fettdruck-Reste", r"\*\*[^*\n]{2,60}\*\*"),
@@ -376,50 +433,123 @@ def _token_depth(token) -> int:
     return depth
 
 
+def _shannon_entropy(counts: Counter) -> Optional[float]:
+    total = sum(counts.values())
+    if total <= 0:
+        return None
+    return -sum((c / total) * math.log2(c / total) for c in counts.values() if c > 0)
+
+
+def _compute_optional_synsets(alpha_tokens) -> Optional[float]:
+    """
+    Prüft optional, ob lokal über NLTK (omw-1.4 / wordnet mit Sprache 'deu')
+    Synsets verfügbar sind, und berechnet die mittlere Bedeutungsvielfalt
+    pro Inhaltswort (NOUN/VERB/ADJ/ADV).
+    """
+    try:
+        from nltk.corpus import wordnet as wn
+        # Schneller Check, ob deutsches WordNet lokal vorhanden ist
+        if "deu" not in wn.langs():
+            return None
+        pos_map = {"NOUN": wn.NOUN, "VERB": wn.VERB, "ADJ": wn.ADJ, "ADV": wn.ADV}
+        syn_counts = []
+        for t in alpha_tokens[:120]:
+            wn_pos = pos_map.get(getattr(t, "pos_", ""))
+            if wn_pos is None:
+                continue
+            lemma = getattr(t, "lemma_", None) or t.text
+            syns = wn.synsets(lemma.lower(), pos=wn_pos, lang="deu")
+            if not syns:
+                syns = wn.synsets(t.text.lower(), pos=wn_pos, lang="deu")
+            if syns:
+                syn_counts.append(len(syns))
+        return statistics.mean(syn_counts) if syn_counts else None
+    except Exception:
+        return None
+
+
 def analyze_deep_linguistics(text: str, nlp=None) -> dict:
     """
     Liefert Wörter, Sätze sowie (wenn ein deutsches spaCy-Modell aktiv ist)
-    tiefere linguistische Merkmale:
+    erweiterte linguistische Merkmale nach der Stuttgarter/GESIS-Studie:
     - lex_density: Anteil Inhaltswörter (NOUN, VERB, ADJ, ADV)
     - pos_entropy: Shannon-Entropie der Wortarten-Verteilung
     - avg_tree_depth / tree_depth_cv: mittlere Syntaxbaum-Tiefe & Streuung
+    - avg_tree_width / tree_width_cv: mittlere Baumbreite (max. Tokens pro Ebene) & Streuung
+    - avg_branching_factor: mittlerer Verzweigungsfaktor (Kinder pro Nicht-Blatt-Token)
+    - noun_chunk_density: Nominalphrasen pro 100 Wörter
+    - dep_entropy: Shannon-Entropie der Universal-Dependencies-/Syntax-Relationen
+    - morph_entropy: Shannon-Entropie der morphologischen Merkmalsbündel
     - entity_density: Dichte benannter Entitäten (Personen, Orte, Organisationen)
+    - avg_synsets: mittlere WordNet-Synset-Anzahl pro Inhaltswort (falls lokal verfügbar)
     """
     if nlp is not None:
         doc = nlp(text)
-        words = [t.text.lower() for t in doc if t.is_alpha]
+        alpha_tokens = [t for t in doc if t.is_alpha]
+        words = [t.text.lower() for t in alpha_tokens]
         sentences = []
         tree_depths = []
+        tree_widths = []
+        branching_counts = []
+
         for sent in doc.sents:
             s_words = [t.text for t in sent if t.is_alpha]
-            if s_words:
-                sentences.append(s_words)
-                depths = [_token_depth(t) for t in sent if not t.is_space]
-                if depths:
-                    tree_depths.append(max(depths))
+            if not s_words:
+                continue
+            sentences.append(s_words)
+
+            level_counts: Counter = Counter()
+            sent_depths = []
+            for t in sent:
+                if t.is_space:
+                    continue
+                d = _token_depth(t)
+                sent_depths.append(d)
+                level_counts[d] += 1
+                n_children = sum(1 for c in t.children if not c.is_space)
+                if n_children > 0:
+                    branching_counts.append(n_children)
+
+            if sent_depths:
+                tree_depths.append(max(sent_depths))
+            if level_counts:
+                tree_widths.append(max(level_counts.values()))
 
         lex_density = None
         pos_entropy = None
-        if words:
+        dep_entropy = None
+        morph_entropy = None
+        if alpha_tokens:
             lexical_pos = {"NOUN", "VERB", "ADJ", "ADV"}
-            lex_count = sum(1 for t in doc if t.is_alpha and t.pos_ in lexical_pos)
-            lex_density = lex_count / len(words)
+            lex_count = sum(1 for t in alpha_tokens if t.pos_ in lexical_pos)
+            lex_density = lex_count / len(alpha_tokens)
 
-            pos_counts = Counter(t.pos_ for t in doc if t.is_alpha)
-            total_pos = sum(pos_counts.values())
-            if total_pos > 0:
-                pos_entropy = -sum(
-                    (c / total_pos) * math.log2(c / total_pos)
-                    for c in pos_counts.values()
-                    if c > 0
-                )
+            pos_entropy = _shannon_entropy(Counter(t.pos_ for t in alpha_tokens))
+            dep_entropy = _shannon_entropy(Counter(t.dep_ for t in alpha_tokens if getattr(t, "dep_", "")))
+            morph_strs = [str(t.morph) for t in alpha_tokens if str(getattr(t, "morph", ""))]
+            if morph_strs:
+                morph_entropy = _shannon_entropy(Counter(morph_strs))
 
         avg_tree_depth = statistics.mean(tree_depths) if tree_depths else None
         tree_depth_cv = None
         if len(tree_depths) >= 3 and avg_tree_depth and avg_tree_depth > 0:
             tree_depth_cv = statistics.stdev(tree_depths) / avg_tree_depth
 
+        avg_tree_width = statistics.mean(tree_widths) if tree_widths else None
+        tree_width_cv = None
+        if len(tree_widths) >= 3 and avg_tree_width and avg_tree_width > 0:
+            tree_width_cv = statistics.stdev(tree_widths) / avg_tree_width
+
+        avg_branching_factor = statistics.mean(branching_counts) if branching_counts else None
+
+        try:
+            n_chunks = sum(1 for _ in doc.noun_chunks)
+            noun_chunk_density = (100.0 * n_chunks / len(words)) if words else None
+        except Exception:
+            noun_chunk_density = None
+
         entity_density = (len(doc.ents) / len(words)) if words else None
+        avg_synsets = _compute_optional_synsets(alpha_tokens)
 
         return {
             "words": words,
@@ -428,7 +558,14 @@ def analyze_deep_linguistics(text: str, nlp=None) -> dict:
             "pos_entropy": pos_entropy,
             "avg_tree_depth": avg_tree_depth,
             "tree_depth_cv": tree_depth_cv,
+            "avg_tree_width": avg_tree_width,
+            "tree_width_cv": tree_width_cv,
+            "avg_branching_factor": avg_branching_factor,
+            "noun_chunk_density": noun_chunk_density,
+            "dep_entropy": dep_entropy,
+            "morph_entropy": morph_entropy,
             "entity_density": entity_density,
+            "avg_synsets": avg_synsets,
         }
 
     # Regex-Fallback ohne spaCy-Modell
@@ -448,7 +585,14 @@ def analyze_deep_linguistics(text: str, nlp=None) -> dict:
         "pos_entropy": None,
         "avg_tree_depth": None,
         "tree_depth_cv": None,
+        "avg_tree_width": None,
+        "tree_width_cv": None,
+        "avg_branching_factor": None,
+        "noun_chunk_density": None,
+        "dep_entropy": None,
+        "morph_entropy": None,
         "entity_density": None,
+        "avg_synsets": None,
     }
 
 
@@ -469,6 +613,68 @@ def compute_information_metrics(text: str, words: List[str]) -> Tuple[float, flo
     if len(raw_bytes) > 0:
         comp_ratio = len(zlib.compress(raw_bytes, level=6)) / len(raw_bytes)
     return word_entropy, comp_ratio
+
+
+def compute_valence_and_psycholinguistics(text: str, words: List[str], entity_density: Optional[float]) -> dict:
+    """
+    Berechnet sprachübergreifend inspirierte (auf Deutsch kalibrierte)
+    Valenz-, Emotions- und Psycholinguistik-Kennzahlen:
+    - valence_mean / valence_std: Mittelwert & Streuung der Polarität (-1 bis +1)
+    - smooth_pos_count / neg_spike_count: geglättete positive vs. stark negative Wörter
+    - concreteness_score: Verhältnis konkreter Marker (Zahlen, Entitäten, Konkreta) vs. Abstrakta
+    - avg_word_len / long_word_ratio: Näherung für Wortprävalenz / Komposita-Lastigkeit
+    """
+    if not words:
+        return {
+            "valence_mean": 0.0,
+            "valence_std": 0.0,
+            "smooth_pos_count": 0,
+            "neg_spike_count": 0,
+            "concreteness_score": 0.5,
+            "avg_word_len": 0.0,
+            "long_word_ratio": 0.0,
+        }
+
+    polarities = []
+    smooth_pos = 0
+    neg_spike = 0
+    for w in words:
+        if w in GERMAN_POSITIVE_SMOOTH_WORDS:
+            polarities.append(0.75)
+            smooth_pos += 1
+        elif w in GERMAN_NEGATIVE_STRONG_WORDS:
+            polarities.append(-1.0)
+            neg_spike += 1
+        else:
+            polarities.append(0.0)
+
+    valence_mean = statistics.mean(polarities)
+    valence_std = statistics.stdev(polarities) if len(polarities) >= 2 else 0.0
+
+    # Konkretheit: Zahlen/Jahreszahlen + konkrete Substantive + Named Entities vs. abstrakte Suffixe
+    num_hits = len(re.findall(r"\b\d+(?:[.,]\d+)?\b", text))
+    concrete_hits = sum(1 for w in words if w in CONCRETE_OBJECT_WORDS)
+    abstract_hits = sum(
+        1 for w in words
+        if len(w) >= 7 and re.search(r"(ung|ungen|heit|heiten|keit|keiten|schaft|schaften|tion|tionen|ität|itäten|ismus|anz|enz)$", w)
+    )
+    ent_bonus = (entity_density * len(words)) if entity_density is not None else 0.0
+    concrete_signal = concrete_hits + 0.6 * num_hits + 1.2 * ent_bonus
+    total_ca = concrete_signal + abstract_hits
+    concreteness_score = (concrete_signal / total_ca) if total_ca > 0 else 0.5
+
+    avg_word_len = statistics.mean(len(w) for w in words)
+    long_word_ratio = sum(1 for w in words if len(w) >= 13) / len(words)
+
+    return {
+        "valence_mean": valence_mean,
+        "valence_std": valence_std,
+        "smooth_pos_count": smooth_pos,
+        "neg_spike_count": neg_spike,
+        "concreteness_score": concreteness_score,
+        "avg_word_len": avg_word_len,
+        "long_word_ratio": long_word_ratio,
+    }
 
 
 def get_perplexity_device():
@@ -818,7 +1024,14 @@ def analyze_passage(
     pos_entropy = ling["pos_entropy"]
     avg_tree_depth = ling["avg_tree_depth"]
     tree_depth_cv = ling["tree_depth_cv"]
+    avg_tree_width = ling["avg_tree_width"]
+    tree_width_cv = ling["tree_width_cv"]
+    avg_branching_factor = ling["avg_branching_factor"]
+    noun_chunk_density = ling["noun_chunk_density"]
+    dep_entropy = ling["dep_entropy"]
+    morph_entropy = ling["morph_entropy"]
     entity_density = ling["entity_density"]
+    avg_synsets = ling["avg_synsets"]
 
     word_count = len(words)
     sentence_count = len(sentences)
@@ -906,7 +1119,7 @@ def analyze_passage(
         score += 7.0 * mult
         reasons.append(f"[Info-Theorie] Hohe sprachliche Redundanz / Komprimierbarkeit (Ratio {comp_ratio:.2f})")
 
-    # Tiefere spaCy-Merkmale (Syntaxbaum, POS-Entropie, Lexikalische Dichte, Named Entities)
+    # Tiefere spaCy-Merkmale (Syntaxbaum, Baumbreite, Verzweigung, Nominalphrasen, UD/Morphologie, Synsets)
     if lex_density is not None and word_count >= 80 and lex_density >= 0.58:
         score += 7.0 * mult
         reasons.append(f"[spaCy-Lexik] Sehr hohe Dichte an Inhaltswörtern ({lex_density:.2f})")
@@ -917,6 +1130,28 @@ def analyze_passage(
             f"[spaCy-Syntax] Gleichförmige Satzbaum-Tiefe (CV {tree_depth_cv:.2f}, Ø {avg_tree_depth:.1f})"
         )
 
+    if tree_width_cv is not None and sentence_count >= 4 and tree_width_cv < 0.24:
+        score += 6.5 * mult
+        reasons.append(
+            f"[spaCy-Syntax] Gleichförmige Satzbaum-Breite (CV {tree_width_cv:.2f}, Ø {avg_tree_width:.1f})"
+        )
+
+    if avg_branching_factor is not None and sentence_count >= 4 and avg_branching_factor < 1.65:
+        score += 5.0 * mult
+        reasons.append(f"[spaCy-Syntax] Geringer Verzweigungsfaktor ({avg_branching_factor:.2f})")
+
+    if noun_chunk_density is not None and word_count >= 80 and noun_chunk_density >= 24.0:
+        score += 6.0 * mult
+        reasons.append(f"[spaCy-Syntax] Hohe Nominalphrasen-Dichte ({noun_chunk_density:.1f} pro 100 Wörter)")
+
+    if dep_entropy is not None and word_count >= 80 and dep_entropy < 3.15:
+        score += 5.5 * mult
+        reasons.append(f"[spaCy-UD] Geringe Vielfalt der Syntax-Relationen (Entropie {dep_entropy:.2f})")
+
+    if morph_entropy is not None and word_count >= 80 and morph_entropy < 3.40:
+        score += 5.0 * mult
+        reasons.append(f"[spaCy-Morph] Geringe morphologische Variabilität (Entropie {morph_entropy:.2f})")
+
     if pos_entropy is not None and word_count >= 80 and pos_entropy < 2.95:
         score += 6.0 * mult
         reasons.append(f"[spaCy-POS] Geringe Wortarten-Variabilität (Entropie {pos_entropy:.2f})")
@@ -924,6 +1159,33 @@ def analyze_passage(
     if entity_density is not None and word_count >= 100 and entity_density < 0.01:
         score += 5.0 * mult
         reasons.append("[spaCy-NER] Kaum konkrete benannte Entitäten (eher vage/generische Prosa)")
+
+    # Semantik: Hedges (Abschwächungen) & Inline-Markierung
+    hedge_matches = []
+    for pat in GERMAN_HEDGES:
+        for m in re.finditer(pat, lower_text):
+            hedge_matches.append(m)
+            raw_spans.append(
+                TextSpan(m.start(), m.end(), "buzzword", 42, f"[Semantik/Hedge] Abschwächung „{text[m.start():m.end()]}“")
+            )
+    hedge_density = (100.0 * len(hedge_matches) / word_count) if word_count > 0 else 0.0
+    if len(hedge_matches) >= 3 and hedge_density >= 2.2:
+        score += min(11.0, len(hedge_matches) * 2.5 * mult)
+        reasons.append(f"[Semantik] Häufige Abschwächungen / Hedges ({len(hedge_matches)}x, {hedge_density:.1f}%)")
+
+    # Emotion, Valenz & Psycholinguistik
+    psy = compute_valence_and_psycholinguistics(text, words, entity_density)
+    if word_count >= 70 and psy["smooth_pos_count"] >= 3 and psy["neg_spike_count"] == 0:
+        score += 7.5 * mult
+        reasons.append(
+            f"[Valenz] Geglättete, leicht positive Tonalität ({psy['smooth_pos_count']}x positiv, keine negativen Ausschläge)"
+        )
+
+    if word_count >= 70 and psy["concreteness_score"] < 0.25:
+        score += 6.5 * mult
+        reasons.append(
+            f"[Psycholinguistik] Geringe Konkretheit / stark abstrakter Stil (Index {psy['concreteness_score']:.2f})"
+        )
 
     # Menschliche Gegensignale
     has_personal = bool(re.search(r"\b(ich|wir|mein|meine|unser|unsere)\b", lower_text))
@@ -959,8 +1221,10 @@ def analyze_passage(
             human_bonus += 5.0
         if entity_density is not None and entity_density >= 0.04:
             human_bonus += 4.0
+        if psy["neg_spike_count"] >= 2:
+            human_bonus += 5.0
         if human_bonus > 0:
-            score -= min(14.0, human_bonus)
+            score -= min(16.0, human_bonus)
 
     score = max(0.0, min(100.0, round(score, 1)))
     if hard_tell or score >= profile["strong_threshold"]:
@@ -978,11 +1242,22 @@ def analyze_passage(
         "nominal_ratio": round(nominal_ratio, 3),
         "word_entropy": round(word_entropy, 2),
         "comp_ratio": round(comp_ratio, 3),
+        "hedge_density": round(hedge_density, 2),
+        "valence_mean": round(psy["valence_mean"], 3),
+        "concreteness": round(psy["concreteness_score"], 2),
+        "avg_word_len": round(psy["avg_word_len"], 2),
         "lex_density": round(lex_density, 3) if lex_density is not None else None,
         "avg_tree_depth": round(avg_tree_depth, 2) if avg_tree_depth is not None else None,
         "tree_depth_cv": round(tree_depth_cv, 3) if tree_depth_cv is not None else None,
+        "avg_tree_width": round(avg_tree_width, 2) if avg_tree_width is not None else None,
+        "tree_width_cv": round(tree_width_cv, 3) if tree_width_cv is not None else None,
+        "avg_branching": round(avg_branching_factor, 2) if avg_branching_factor is not None else None,
+        "noun_chunk_density": round(noun_chunk_density, 1) if noun_chunk_density is not None else None,
+        "dep_entropy": round(dep_entropy, 2) if dep_entropy is not None else None,
+        "morph_entropy": round(morph_entropy, 2) if morph_entropy is not None else None,
         "pos_entropy": round(pos_entropy, 2) if pos_entropy is not None else None,
         "entity_density": round(entity_density, 3) if entity_density is not None else None,
+        "avg_synsets": round(avg_synsets, 2) if avg_synsets is not None else None,
     }
 
     return PassageResult(
@@ -1307,13 +1582,28 @@ def format_report_markdown(report: DocumentReport) -> str:
         extras = [
             f"Entropie={m['word_entropy']}",
             f"Kompr.={m['comp_ratio']}",
+            f"Hedges={m['hedge_density']}%",
+            f"Valenz={m['valence_mean']}",
+            f"Konkr.={m['concreteness']}",
         ]
         if m.get("lex_density") is not None:
             extras.append(f"Lex.Dichte={m['lex_density']}")
         if m.get("avg_tree_depth") is not None:
             extras.append(f"Syntaxtiefe={m['avg_tree_depth']} (CV={m['tree_depth_cv']})")
+        if m.get("avg_tree_width") is not None:
+            extras.append(f"Baumbreite={m['avg_tree_width']} (CV={m['tree_width_cv']})")
+        if m.get("avg_branching") is not None:
+            extras.append(f"Verzw.={m['avg_branching']}")
+        if m.get("noun_chunk_density") is not None:
+            extras.append(f"NP={m['noun_chunk_density']}/100W")
+        if m.get("dep_entropy") is not None:
+            extras.append(f"UD-Entr.={m['dep_entropy']}")
+        if m.get("morph_entropy") is not None:
+            extras.append(f"Morph-Entr.={m['morph_entropy']}")
         if m.get("pos_entropy") is not None:
             extras.append(f"POS-Entr.={m['pos_entropy']}")
+        if m.get("avg_synsets") is not None:
+            extras.append(f"Synsets={m['avg_synsets']}")
         if p.perplexity is not None:
             extras.append(f"PPL={p.perplexity}")
 
@@ -1793,7 +2083,7 @@ def launch_gui():
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Lokaler KI-Text-Prüfer v10 (Deutsch)")
+    parser = argparse.ArgumentParser(description="Lokaler KI-Text-Prüfer v11 (Deutsch)")
     parser.add_argument("--cli", type=str, help="Pfad zu einer PDF- oder Textdatei für den Terminal-Modus")
     parser.add_argument(
         "--sensitivity",
